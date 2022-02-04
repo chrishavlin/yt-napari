@@ -23,7 +23,7 @@ jobs:
     strategy:
       matrix:
         platform: [windows-latest]
-        python-version: [3.7, 3.8, 3.9]
+        python-version: [3.9]
 
     steps:
       - uses: actions/checkout@v2
@@ -62,7 +62,10 @@ jobs:
       - name: Test with tox
         uses: GabrielBB/xvfb-action@v1
         with:
-          run: tox --py current
+          run: |
+            python --version
+            which tox
+            tox --version
         env:
           PLATFORM: ${{ matrix.platform }}
 
