@@ -6,13 +6,16 @@ from magicgui import type_map, widgets
 
 from yt_napari import _data_model
 from yt_napari.logging import ytnapari_log
-
+from pydantic_core import PydanticUndefined
 
 def set_default(variable, default):
     if variable is None:
         return default
     return variable
 
+
+_dm_list = [ky for ky in _data_model.__dict__.keys() if ky.startswith('_') is False]
+_dm_list = ['yt_napari._data_model.' + _dm for _dm in _dm_list]
 
 # the following class builds a registry framework for converting from pydantic
 # field to a magicgui widget and back. This is useful for modifying the type
@@ -24,7 +27,7 @@ class MagicPydanticRegistry:
 
     def register(
         self,
-        pydantic_model: Union[pydantic.BaseModel, pydantic.main.ModelMetaclass],
+        pydantic_model,
         field: str,
         magicgui_factory: Callable = None,
         magicgui_args: Optional[tuple] = None,
@@ -104,7 +107,7 @@ class MagicPydanticRegistry:
 
     def add_pydantic_to_container(
         self,
-        py_model: Union[pydantic.BaseModel, pydantic.main.ModelMetaclass],
+        py_model,
         container: widgets.Container,
         ignore_attrs: Optional[Union[str, List[str]]] = None,
     ):
@@ -116,21 +119,20 @@ class MagicPydanticRegistry:
                 ignore_attrs,
             ]
 
-        for field, field_def in py_model.__fields__.items():
+        for field, field_def in py_model.model_fields.items():
             if field in ignore_attrs:
                 continue
-            ftype = field_def.type_
-            if isinstance(ftype, pydantic.BaseModel) or isinstance(
-                ftype, pydantic.main.ModelMetaclass
-            ):
+            ftype = field_def.annotation
+
+            if ftype_in_dm_list(ftype):
                 # the field is a pydantic class, add a container for it and fill it
                 new_widget_cls = widgets.Container
-                new_widget = new_widget_cls(name=field_def.name)
+                new_widget = new_widget_cls(name=field)
                 self.add_pydantic_to_container(ftype, new_widget)
             elif self.is_registered(py_model, field):
                 new_widget = self.get_widget_instance(py_model, field)
             else:
-                new_widget = get_magicguidefault(field_def)
+                new_widget = get_magicguidefault(field, field_def)
                 if isinstance(new_widget, widgets.EmptyWidget):
                     msg = "magicgui could not identify a widget for "
                     msg += f" {py_model}.{field}, which has type {ftype}"
@@ -152,19 +154,18 @@ class MagicPydanticRegistry:
             ]
 
         # traverse model fields, pull out values from container
-        for field, field_def in py_model.__fields__.items():
+        for field, field_def in py_model.model_fields.items():
             if field in ignore_attrs:
                 continue
-            ftype = field_def.type_
-            if isinstance(ftype, pydantic.BaseModel) or isinstance(
-                ftype, pydantic.main.ModelMetaclass
-            ):
+            ftype = field_def.annotation
+            if ftype_in_dm_list(ftype) or "typing.List" in str(ftype):
                 new_kwargs = {}  # new dictionary for the new nest level
                 # any pydantic class will be a container, so pull that out to pass
                 # to the recursive call
-                sub_container = getattr(container, field_def.name)
-                self.get_pydantic_kwargs(sub_container, ftype, new_kwargs)
-                if "typing.List" in str(field_def.outer_type_):
+                sub_container = getattr(container, field)
+                inside_model = ftype.__args__[0]  # the type in the list
+                self.get_pydantic_kwargs(sub_container, inside_model, new_kwargs)
+                if "typing.List" in str(field_def.annotation):
                     new_kwargs = [
                         new_kwargs,
                     ]
@@ -172,15 +173,15 @@ class MagicPydanticRegistry:
 
             elif self.is_registered(py_model, field):
                 widget_instance = getattr(
-                    container, field_def.name
+                    container, field
                 )  # pull from container
                 pydantic_kwargs[field] = self.get_pydantic_attr(
                     py_model, field, widget_instance
                 )
             else:
                 # not a pydantic class, just pull the field value from the container
-                if hasattr(container, field_def.name):
-                    value = getattr(container, field_def.name).value
+                if hasattr(container, field):
+                    value = getattr(container, field).value
                     pydantic_kwargs[field] = value
 
 
@@ -196,13 +197,16 @@ def get_filename(file_widget: widgets.FileEdit):
     return str(file_widget.value)
 
 
-def get_magicguidefault(field_def: pydantic.fields.ModelField):
+def get_magicguidefault(fname: str, field_def: pydantic.fields.Field):
     # returns an instance of the default widget selected by magicgui
-    ftype = field_def.type_
+    ftype = field_def.annotation
+    dict_opts = dict(name=fname, annotation=ftype)
+    if not field_def.default == PydanticUndefined:
+        dict_opts['value'] = field_def.default
     new_widget_cls, ops = type_map.get_widget_class(
         None,
         ftype,
-        dict(name=field_def.name, value=field_def.default, annotation=ftype),
+        dict_opts,
         raise_on_unknown=False,
     )
     if field_def.default is None:
@@ -225,8 +229,8 @@ def split_comma_sep_string(widget_instance) -> List[str]:
     return files.split(",")
 
 
-def _get_pydantic_model_field(py_model, field: str) -> pydantic.fields.ModelField:
-    return py_model.__fields__[field]
+def _get_pydantic_model_field(py_model, field: str) -> pydantic.fields.Field:
+    return py_model.model_fields[field]
 
 
 # the following model-field tuples will be embedded in containers
@@ -254,7 +258,7 @@ def _register_yt_data_model(translator: MagicPydanticRegistry):
             py_model,
             field,
             magicgui_factory=get_magicguidefault,
-            magicgui_args=(py_model.__fields__[field]),
+            magicgui_args=(field, py_model.model_fields[field]),
             pydantic_attr_factory=embed_in_list,
         )
     translator.register(
@@ -269,7 +273,7 @@ def _register_yt_data_model(translator: MagicPydanticRegistry):
         _data_model.TimeSeriesFileSelection,
         "file_list",
         magicgui_factory=get_magicguidefault,
-        magicgui_args=(_data_model.TimeSeriesFileSelection.__fields__["file_list"],),
+        magicgui_args=("file_list", _data_model.TimeSeriesFileSelection.model_fields["file_list"],),
         pydantic_attr_factory=split_comma_sep_string,
     )
 
@@ -280,9 +284,7 @@ _register_yt_data_model(translator)
 
 def get_yt_data_container(
     ignore_attrs: Optional[Union[str, List[str]]] = None,
-    pydantic_model_class: Optional[
-        Union[pydantic.BaseModel, pydantic.main.ModelMetaclass]
-    ] = None,
+    pydantic_model_class: Optional = None,
 ) -> widgets.Container:
     if pydantic_model_class is None:
         pydantic_model_class = _data_model.DataContainer
@@ -319,3 +321,12 @@ def get_yt_metadata_container():
     data_container = widgets.Container()
     translator.add_pydantic_to_container(_data_model.MetadataModel, data_container)
     return data_container
+
+
+def ftype_in_dm_list(ftype):
+
+    ftype_name = str(ftype)
+    if "<class" in ftype_name:
+        ftype_name = "yt_napari._data_model." + ftype.__name__
+
+    return ftype_name in _dm_list
